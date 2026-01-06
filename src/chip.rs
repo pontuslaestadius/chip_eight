@@ -1,229 +1,118 @@
+use crate::controls::{Chip8Key, Keypad};
+use crate::display::display_trait::Ch8Display;
+use crate::memory::Memory;
+use crate::registers::Registers;
+use crate::stack::Stack;
+use crate::timers::Timers;
 use crate::*;
-use std::io::{Read, Write};
-use termion::raw::RawTerminal;
 
 pub struct Chip {
-    pub ram: [u8; MEMORY_SIZE],
+    pub memory: Memory,
     pub program_counter: usize,
-    pub index_register: usize,
-    pub stack: Vec<usize>, // LIFO
-    pub delay_timer: u8,
-    pub sound_timer: u8,
-    pub var_reg: [u8; 16],
-    pub display_buffer: [[bool; DISPLAY_WIDTH]; DISPLAY_HEIGHT],
+    pub stack: Stack, // LIFO
+    pub timers: Timers,
+    pub registers: Registers,
+    pub display: Box<dyn Ch8Display>,
+    pub keypad: Keypad,
+    pub wait_for_input: Option<u8>,
 }
 
+const FONT_START: usize = 0x50;
+
 impl Chip {
-    pub fn new() -> Self {
+    pub fn new(display: impl Ch8Display + 'static) -> Self {
         let mut chip = Chip {
-            ram: [0; MEMORY_SIZE],
+            memory: Memory::new(),
             program_counter: 512, // 512th position
-            index_register: 0,
-            stack: Vec::new(),
-            delay_timer: 0,
-            sound_timer: 0,
-            var_reg: [0; 16], // Variable registers
-            display_buffer: [[false; DISPLAY_WIDTH]; DISPLAY_HEIGHT],
+            stack: Stack::new(),
+            timers: Timers::new(),
+            registers: Registers::new(),
+            display: Box::new(display),
+            keypad: Keypad::new(),
+            wait_for_input: None,
         };
-        chip.set_memory_at_position(0x50, &FONT_DATA);
+        chip.set_memory_at_position(FONT_START, &FONT_DATA);
         chip
     }
+
+    // EX9E — skip if key in Vx is pressed
+    pub fn skip_if_pressed(&mut self, vx: u8) {
+        self.skip_if(
+            Chip8Key::new(vx)
+                .map(|k| self.keypad.is_pressed(k))
+                .unwrap_or(false),
+        )
+    }
+
+    pub fn skip_if_not_pressed(&mut self, vx: u8) {
+        self.skip_if(
+            Chip8Key::new(vx)
+                .map(|k| !self.keypad.is_pressed(k))
+                .unwrap_or(false),
+        )
+    }
+
+    pub fn try_press(&mut self, ch: char) -> Option<Chip8Key> {
+        if let Some(key) = self.keypad.lookup(ch) {
+            // println!("Pressed '{}' → CHIP-8 key {:X}", ch, key.as_u8());
+            self.keypad.clear();
+            self.keypad.press(key);
+            return Some(key);
+        }
+        None
+    }
+
+    // FX0A — wait for key press (non-blocking)
+    pub fn wait_for_key(&mut self) -> Option<u8> {
+        self.keypad.take_last_pressed().map(|k| k.as_u8())
+    }
+
+    pub fn opcode_dxyn(&mut self, x: Nibble, y: Nibble, n: Nibble) {
+        let vx = self.registers.get(x);
+        let vy = self.registers.get(y);
+
+        let i = self.registers.get_i() as usize;
+        let sprite = &self.memory.slice(i, i + n.as_usize());
+
+        let collision = self.display.draw_sprite(vx, vy, sprite);
+        self.display.render();
+
+        self.registers.set(Nibble::from_low(0xF), collision as u8);
+    }
+
     pub fn increment_counter(&mut self, n: usize) {
         self.program_counter += n;
     }
-    pub fn fetch(&mut self) -> u16 {
-        let result = combine_u8_to_u16(
-            self.ram[self.program_counter],
-            self.ram[self.program_counter + 1],
-        );
-        self.increment_counter(2);
-        result
-    }
-    pub fn terminal_display(&mut self, instruction: u16) {
-        clear_terminal();
-        let vx = self.read_var_reg_x(instruction);
-        let vy = self.read_var_reg_y(instruction);
-        let n: u8 = n(instruction);
-        let x: u8 = vx % DISPLAY_WIDTH as u8;
-        let y: u8 = vy % DISPLAY_HEIGHT as u8;
-        self.var_reg[15] = 0;
-
-        for row_n in 0..n {
-            let y_coordinate = (y + row_n) as usize;
-            if y_coordinate >= DISPLAY_WIDTH {
-                break;
-            }
-            let n_th_byte = self.ram[self.index_register + row_n as usize];
-            for bit in 0..8u8 {
-                let value = n_th_byte >> (7 - bit) & 0x01;
-                let x_coordinate = (x + bit) as usize;
-                if x_coordinate >= DISPLAY_WIDTH {
-                    break;
-                }
-                let render_value = self.display_buffer[y_coordinate][x_coordinate];
-                if render_value && value == 0x01 {
-                    self.display_buffer[y_coordinate][x_coordinate] = false;
-                    self.var_reg[15] = 0;
-                } else if value == 0x01 && !render_value {
-                    self.display_buffer[y_coordinate][x_coordinate] = true;
-                } else {
-                }
-            }
-        }
-
-        for _y in 0..DISPLAY_HEIGHT {
-            for _x in 0..DISPLAY_WIDTH {
-                if self.display_buffer[_y][_x] {
-                    print!("⬜");
-                } else {
-                    print!("⬛");
-                }
-            }
-            println!("");
-        }
-    }
-
-    pub fn termion_display<W: Write + std::os::fd::AsFd>(
-        &mut self,
-        stdout: &mut RawTerminal<W>,
-        instruction: u16,
-    ) {
-        let vx = self.read_var_reg_x(instruction);
-        let vy = self.read_var_reg_y(instruction);
-        let n: u8 = n(instruction);
-        let x: u8 = vx % DISPLAY_WIDTH as u8;
-        let y: u8 = vy % DISPLAY_HEIGHT as u8;
-        self.var_reg[15] = 0;
-        write!(stdout, "{}", termion::cursor::Goto(1, 1)).unwrap();
-
-        for row_n in 0..n {
-            let y_coordinate = (y + row_n) as usize;
-            if y_coordinate >= DISPLAY_WIDTH {
-                break;
-            }
-            let n_th_byte = self.ram[self.index_register + row_n as usize];
-            for bit in 0..8u8 {
-                let value = n_th_byte >> (7 - bit) & 0x01;
-                let x_coordinate = (x + bit) as usize;
-                if x_coordinate >= DISPLAY_WIDTH {
-                    break; // No wrapping.
-                }
-                let render_value = self.display_buffer[y_coordinate][x_coordinate];
-                if render_value && value == 0x01 {
-                    self.display_buffer[y_coordinate][x_coordinate] = false;
-                    write!(
-                        stdout,
-                        "{}",
-                        termion::cursor::Goto(1 + x_coordinate as u16, 1 + y_coordinate as u16)
-                    )
-                    .unwrap();
-                    stdout.write(b" ").unwrap();
-                    self.var_reg[15] = 0;
-                } else if value == 0x01 && !render_value {
-                    self.display_buffer[y_coordinate][x_coordinate] = true;
-                    write!(
-                        stdout,
-                        "{}",
-                        termion::cursor::Goto(1 + x_coordinate as u16, 1 + y_coordinate as u16)
-                    )
-                    .unwrap();
-                    stdout.write(b"x").unwrap();
-                }
-            }
-        }
-
-        // for _y in 0..DISPLAY_HEIGHT {
-        //     for _x in 0..DISPLAY_WIDTH {
-        //         if self.display_buffer[_y][_x] {
-        //             stdout.write(b"x").unwrap();
-        //             // print!("⬜");
-        //         } else {
-        //             stdout.write(b" ").unwrap();
-        //             // print!("⬛");
-        //         }
-        //     }
-        //     // write!(stdout, "{}", termion::clear::CurrentLine).unwrap();
-
-        //     // write!(stdout, "{}", termion::clear::CurrentLine).unwrap();
-        // }
-        write!(stdout, "{}", termion::cursor::Goto(1, 2 + DISPLAY_HEIGHT as u16)).unwrap();
-
-        stdout.flush().unwrap();
-    }
-    pub fn read_variable_register(&self, char: char) -> u8 {
-        let idx = char_to_hex_number(char).unwrap();
-        self.var_reg[idx as usize]
-    }
     pub fn read_var_reg_x(&self, value: u16) -> u8 {
-        let idx = x(value) as usize;
-        self.var_reg[idx]
+        let idx = Nibble::from_opcode(value, 8);
+        self.registers.get(idx)
     }
     pub fn read_var_reg_y(&self, value: u16) -> u8 {
-        let idx = y(value) as usize;
-        self.var_reg[idx]
-    }
-    pub fn set_carry(&mut self, res: u8) {
-        self.var_reg[15] = res;
-    }
-    pub fn get_carry(&mut self) -> u8 {
-        self.var_reg[15]
-    }
-    pub fn pretty_print_progress(&self, rows: usize) {
-        clear_terminal();
-        if self.program_counter > 10 && self.program_counter < 4080 {
-            for i in 0..rows * 2 {
-                if i % 2 != 0 {
-                    continue;
-                }
-                let pc = self.program_counter + i - rows;
-                let s = format!(
-                    "[{:03X?}, {:03X?}] -> {:02X?}{:02X?}",
-                    pc,
-                    pc + 1,
-                    self.ram[pc],
-                    self.ram[pc + 1]
-                );
-
-                if i == rows {
-                    println!(" * {}", s);
-                } else {
-                    println!("   {}", s);
-                }
-            }
-        }
-    }
-    pub fn set_variable_register(&mut self, char: char, value: u8) {
-        let idx = char_to_hex_number(char).unwrap();
-        self.var_reg[idx as usize] = value;
-    }
-    pub fn add_to_variable_register(&mut self, char: char, value: u8) {
-        let idx = char_to_hex_number(char).unwrap() as usize;
-        self.var_reg[idx] = match self.var_reg[idx].checked_add(value) {
-            Some(val) => val,
-            None => 255,
-        };
+        let idx = Nibble::from_opcode(value, 4);
+        self.registers.get(idx)
     }
     pub fn next(&mut self) -> u8 {
-        let result = self.ram[self.program_counter];
+        let result = self.memory.read(self.program_counter);
         self.increment_counter(1);
         result
     }
-    pub fn load_rom(&mut self, bytes: &Vec<u8>) {
-        self.set_memory_at_position(512, &bytes)
+    pub fn next_u16(&mut self) -> u16 {
+        let result = self.memory.read_u16(self.program_counter);
+        self.increment_counter(2);
+        result
+    }
+
+    pub fn load_rom(&mut self, bytes: &[u8]) {
+        self.set_memory_at_position(512, bytes)
     }
     pub fn set_memory_at_position(&mut self, idx: usize, bytes: &[u8]) {
         for (i, &byte) in bytes.iter().enumerate() {
-            self.ram[idx + i] = byte;
+            self.memory.write(idx + i, byte);
         }
     }
-    pub fn print_ram(&self, columns: usize) {
-        println!("DUMPED RAM:");
-        for i in 0..MEMORY_SIZE {
-            print!("{:03X} {:02X?} |", i, self.ram[i]);
-            if i != 0 && i % columns == 0 {
-                println!();
-            }
+    pub fn skip_if(&mut self, condition: bool) {
+        if condition {
+            self.increment_counter(2);
         }
-        println!();
     }
 }
