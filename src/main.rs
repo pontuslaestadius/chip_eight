@@ -96,8 +96,8 @@ fn load_rom(path: &PathBuf) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 fn run_emulator(
-    mut chip: &mut chip::Chip,
-    mut stdout: &mut termion::raw::RawTerminal<std::io::StdoutLock<'static>>,
+    chip: &mut chip::Chip,
+    stdout: &mut termion::raw::RawTerminal<std::io::StdoutLock<'static>>,
     stdin: &mut termion::AsyncReader,
     frame_interval_ms: u64,
 ) {
@@ -142,6 +142,9 @@ fn run_emulator(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse args first before we mess with the terminal.
+    let args = Args::parse();
+
     let (mut stdout, mut stdin) = setup_terminal();
 
     init_logging()?;
@@ -155,7 +158,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap();
     info!("Initializing...");
 
-    let args = Args::parse();
     info!("- Initializing display...");
     let display = TerminalDisplay::new();
     info!("- Creating emulator...");
